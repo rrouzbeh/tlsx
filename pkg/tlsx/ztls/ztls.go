@@ -8,7 +8,11 @@ import (
 	"net"
 	"os"
 	"time"
-
+	"crypto/rand"
+	"encoding/binary"
+	"io"
+	"math/big"
+	"github.com/xtls/xray-core/common/errors"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/tlsx/pkg/output/stats"
@@ -21,6 +25,7 @@ import (
 	"github.com/zmap/zcrypto/encoding/asn1"
 	"github.com/zmap/zcrypto/tls"
 	"github.com/zmap/zcrypto/x509"
+
 )
 
 func init() {
@@ -111,7 +116,7 @@ func (c *Client) ConnectWithOptions(hostname, ip, port string, options clients.C
 	if err != nil {
 		return nil, errorutil.NewWithErr(err).Msgf("failed to create ztls config")
 	}
-
+	
 	ctx := context.Background()
 	if c.options.Timeout != 0 {
 		var cancel context.CancelFunc
@@ -120,11 +125,22 @@ func (c *Client) ConnectWithOptions(hostname, ip, port string, options clients.C
 	}
 
 	// setup tcp connection
-	conn, err := clients.GetConn(ctx, hostname, ip, port, c.options)
-	if err != nil {
-		return nil, errorutil.NewWithErr(err).Msgf("failed to setup connection").WithTag("ztls")
-	}
-	defer conn.Close() //internally done by conn.Close() so just a placeholder
+	// setup tcp connection
+    rawConn, err := clients.GetConn(ctx, hostname, ip, port, c.options)
+    if err != nil {
+        return nil, errorutil.NewWithErr(err).Msgf("failed to setup connection").WithTag("ztls")
+    }
+    defer rawConn.Close() //internally done by conn.Close() so just a placeholder
+
+    // Wrap the raw connection with FragmentedClientHelloConn
+    conn := &FragmentedClientHelloConn{
+        Conn:        rawConn,
+        PacketCount: 0,
+        minLength:   100,
+        maxLength:   200,
+        minInterval: 100,
+        maxInterval: 200,
+    }
 
 	// get resolvedIp
 	resolvedIP, _, err := net.SplitHostPort(conn.RemoteAddr().String())
@@ -281,5 +297,114 @@ func (c *Client) tlsHandshakeWithTimeout(tlsConn *tls.Conn, ctx context.Context)
 	if err == tls.ErrCertsOnly {
 		err = nil
 	}
+	return err
+}
+
+type FragmentWriter struct {
+	io.Writer
+	minLength   int
+	maxLength   int
+	minInterval time.Duration
+	maxInterval time.Duration
+	startPacket int
+	endPacket   int
+	PacketCount int
+}
+
+func (w *FragmentWriter) Write(buf []byte) (int, error) {
+	w.PacketCount += 1
+	if (w.startPacket != 0 && (w.PacketCount < w.startPacket || w.PacketCount > w.endPacket)) || len(buf) <= w.minLength {
+		return w.Writer.Write(buf)
+	}
+
+	nTotal := 0
+	for {
+		randomBytesTo := int(randBetween(int64(w.minLength), int64(w.maxLength))) + nTotal
+		if randomBytesTo > len(buf) {
+			randomBytesTo = len(buf)
+		}
+		n, err := w.Writer.Write(buf[nTotal:randomBytesTo])
+		if err != nil {
+			return nTotal + n, err
+		}
+		nTotal += n
+
+		if nTotal >= len(buf) {
+			return nTotal, nil
+		}
+
+		randomInterval := randBetween(int64(w.minInterval), int64(w.maxInterval))
+		time.Sleep(time.Duration(randomInterval))
+	}
+}
+
+// stolen from github.com/xtls/xray-core/transport/internet/reality
+func randBetween(left int64, right int64) int64 {
+	if left == right {
+		return left
+	}
+	bigInt, _ := rand.Int(rand.Reader, big.NewInt(right-left))
+	return left + bigInt.Int64()
+}
+
+type FragmentedClientHelloConn struct {
+	net.Conn
+	PacketCount int
+	minLength   int
+	maxLength   int
+	minInterval time.Duration
+	maxInterval time.Duration
+}
+
+func (c *FragmentedClientHelloConn) Write(b []byte) (n int, err error) {
+	if len(b) >= 5 && b[0] == 22 && c.PacketCount == 0 {
+		n, err = sendFragmentedClientHello(c, b, c.minLength, c.maxLength)
+		if err == nil {
+			c.PacketCount++
+			return n, err
+		}
+	}
+
+	return c.Conn.Write(b)
+}
+
+func sendFragmentedClientHello(conn *FragmentedClientHelloConn, clientHello []byte, minFragmentSize, maxFragmentSize int) (n int, err error) {
+	if len(clientHello) < 5 || clientHello[0] != 22 {
+		return 0, errors.New("not a valid TLS ClientHello message")
+	}
+
+	clientHelloLen := (int(clientHello[3]) << 8) | int(clientHello[4])
+
+	clientHelloData := clientHello[5:]
+	for i := 0; i < clientHelloLen; {
+		fragmentEnd := i + int(randBetween(int64(minFragmentSize), int64(maxFragmentSize)))
+		if fragmentEnd > clientHelloLen {
+			fragmentEnd = clientHelloLen
+		}
+
+		fragment := clientHelloData[i:fragmentEnd]
+		i = fragmentEnd
+
+		err = writeFragmentedRecord(conn, 22, fragment, clientHello)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return len(clientHello), nil
+}
+
+func writeFragmentedRecord(c *FragmentedClientHelloConn, contentType uint8, data []byte, clientHello []byte) error {
+	header := make([]byte, 5)
+	header[0] = byte(clientHello[0])
+
+	tlsVersion := (int(clientHello[1]) << 8) | int(clientHello[2])
+	binary.BigEndian.PutUint16(header[1:], uint16(tlsVersion))
+
+	binary.BigEndian.PutUint16(header[3:], uint16(len(data)))
+	_, err := c.Conn.Write(append(header, data...))
+	randomInterval := randBetween(int64(c.minInterval), int64(c.maxInterval))
+	time.Sleep(time.Duration(randomInterval))
+
 	return err
 }
